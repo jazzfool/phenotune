@@ -2,60 +2,62 @@ use itertools::Itertools;
 use rand_distr::{Distribution, Normal, Triangular, Uniform};
 use rayon::{
     prelude::{
-        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
-        ParallelBridge, ParallelIterator,
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelBridge, ParallelIterator,
     },
     slice::ParallelSliceMut,
 };
-use realfft::RealFftPlanner;
 use rubato::{FftFixedInOut, Resampler};
 use std::{
     fs::{read_dir, File},
-    ops::Range,
     path::Path,
-    sync::Mutex,
 };
 
 // Sampling rate of the audio while the genetic algorithm runs.
 // Lower values will be much faster but will yield lower final audio fidelity.
 const HZ: u32 = 20000;
-// How many seconds per chunk each sample audio is cut into when intially loaded.
-const SAMPLE_CHUNK_SECS: f32 = 1.0;
-// How large each chunk of target audio we work on are. Must be greater than SAMPLE_CHUNK_SECS.
-const TARGET_CHUNK_SECS: f32 = 5.0;
+// Minimum duration of a sample.
+const SAMPLE_MIN_SECS: f32 = 0.2;
 // How many generations will run. More generations means reaching a better fitting solution.
-const GENERATIONS: u32 = 50;
+const GENERATIONS: u32 = 500;
+// Each N generations the initial population will be mixed in to add variety.
+const SOFT_RESET_GENERATION: u32 = 25;
+// Each N generations the population is reset to the initial population to escape local optima.
+const HARD_RESET_GENERATION: u32 = 100;
 // This is how many offspring each sample will create (not taking into account two offspring per one split transformation).
-const OFFSPRINGS_PER_SAMPLE: usize = 3;
+const OFFSPRINGS_PER_SAMPLE: usize = 5;
 // The max number of samples that can ever survive from one generation. Take this as the overpopulation threshold.
-const GENERATION_CAPACITY: usize = 500;
-// Number of the best samples are going to be added to the output audio per generation.
+const GENERATION_CAPACITY: usize = 1000;
+// The top N samples are added to the output signal.
 const OUTPUT_CAPACITY: usize = 10;
-// How many seconds of tolerance are going to be accepted when comparing nearby delays of other output samples.
-// If the delay of a sample is too close to a delay that is already outputted in the same generation, it will be skipped.
-const NEARBY_DELAY_TOLERANCE: f32 = 0.3;
-// How many seconds of silence is tolerated before it is removed from the sample audio.
-const SILENCE_TOLERANCE: f32 = 0.5;
+// Ratio of mix between current output and selected samples. 0.5 means each selected sample is average with the current output signal.
+const OUTPUT_MIX: f32 = 0.9;
 // The top percentile of population that survive to transform/crossover.
 const SURVIVAL_RATIO: f32 = 0.5;
-// Generation index modulo for resetting the fitness seeding.
-// As in, if this is e.g., 10, then every 10 generations the fitness will be recalculated from scratch (these generations are significantly slower to compute).
-const SEED_RESET_MOD: u32 = 25;
 // Percentage of surviving population that is chosen (at random) to be crossed over (signals added together).
 const CROSSOVER_RATIO: f32 = 0.1;
+// What is the ideal duration of a sample?
+// Samples deviating from this duration (in seconds) will have their score scaled down.
+const TARGET_SAMPLE_DURATION: f32 = 0.7;
 
 // The number of elites selected per generation is calculated as
 //      population_count * ELITISM_RATIO * 2^(ELITISM_COEFF * (generation / total_generations) - ELITISM_COEFF)
 // This is so that it can "ramp up" as we approach the end of our generation.
 
 // Thew highest percentage of elitism possible.
-// Essentially, on the very last generation, this is how many percent of the population will be taken as elites.
+// Essentially, on the very last generation, this is the percent of the population that will be taken as elites.
 // It's recommended that if you're running a low number of generations, that this be equal or very close to 0.
-const ELITISM_RATIO: f32 = 0.;
+const ELITISM_RATIO: f32 = 0.1;
 // How much the elitism is scaled through the generations.
 // The higher this number is, the more delayed elitism will be.
 // Must be >= 0. To disable "dynamic elitism", set this value to 0 and the elitism ratio will remain constant through every generation.
 const ELITISM_COEFF: f32 = 10.0;
+
+// Number of bins of the spectrogram on the x-axis.
+// Longer target audios may need more bins for better time resolution.
+const SPECT_XBINS: usize = 2048;
+// Number of bins of the spectrogram on the y-axis
+const SPECT_YBINS: usize = 256;
 
 fn freq_pitch(cents: i32) -> u32 {
     (2.0f32.powf(cents as f32 / 1200.0) * HZ as f32) as _
@@ -73,9 +75,9 @@ fn frames_to_secs(frames: usize) -> f32 {
 struct Sample {
     pub id: u64,
     pub signal: [Vec<f32>; 2], // stereo
-    pub state: Option<(u32, f32)>,
-    pub seed: Option<u32>,
+    pub state: Option<(u32, f64)>,
     pub gain: f32,
+    pub spect: Option<Vec<f32>>,
 }
 
 impl Sample {
@@ -84,8 +86,8 @@ impl Sample {
             id: 0,
             signal: [vec![0.; len], vec![0.; len]],
             state: None,
-            seed: None,
             gain: 1.,
+            spect: None,
         }
     }
 
@@ -104,8 +106,8 @@ impl Sample {
             id: 0,
             signal: [l, r],
             state: None,
-            seed: None,
             gain: 1.,
+            spect: None,
         }
         .resample(header.sampling_rate, HZ)
     }
@@ -138,8 +140,8 @@ impl Sample {
                 id: 0,
                 signal: [l.to_vec(), r.to_vec()],
                 state: None,
-                seed: None,
                 gain: self.gain,
+                spect: None,
             })
             .collect()
     }
@@ -153,8 +155,10 @@ impl Sample {
 
         let mut resampler =
             FftFixedInOut::new(f1 as _, f2 as _, CHUNK_SIZE, 2).expect("init resampler");
-        let mut left_out = vec![0.; resampler.output_frames_max()];
-        let mut right_out = vec![0.; resampler.output_frames_max()];
+        let mut left_out = vec![];
+        left_out.reserve(resampler.output_frames_max());
+        let mut right_out = vec![];
+        right_out.reserve(resampler.output_frames_max());
 
         let mut remaining = self.signal[0].len();
         let mut next_frames = resampler.input_frames_next();
@@ -192,8 +196,8 @@ impl Sample {
             id: self.id,
             signal: [left_out, right_out],
             state: None,
-            seed: self.state.map(|(x, _)| x),
             gain: self.gain,
+            spect: None,
         }
     }
 
@@ -204,8 +208,8 @@ impl Sample {
             id: self.id,
             signal: out,
             state: None,
-            seed: self.state.map(|(x, _)| x),
             gain: self.gain,
+            spect: None,
         }
     }
 
@@ -217,15 +221,15 @@ impl Sample {
                 id: self.id,
                 signal: [a_left.to_vec(), a_right.to_vec()],
                 state: None,
-                seed: self.state.map(|(x, _)| x),
                 gain: self.gain,
+                spect: None,
             },
             Sample {
                 id: self.id,
                 signal: [b_left.to_vec(), b_right.to_vec()],
                 state: None,
-                seed: self.state.map(|(x, _)| x),
                 gain: self.gain,
+                spect: None,
             },
         ]
     }
@@ -242,8 +246,8 @@ impl Sample {
                 id: self.id,
                 signal: self.signal.clone(),
                 state: None,
-                seed: self.state.map(|(x, _)| x),
                 gain: self.gain,
+                spect: None,
             };
         }
 
@@ -253,17 +257,17 @@ impl Sample {
             id: self.id,
             signal: [left, right],
             state: None,
-            seed: self.state.map(|(x, _)| x),
             gain: self.gain * ratio,
+            spect: None,
         }
     }
 
     fn transforms(&self, n: usize, target: &Sample, out: &mut Vec<Sample>, max_len: &mut usize) {
-        let type_dist = Uniform::new(0, 5);
+        let type_dist = Uniform::new_inclusive(0, 4);
         let split_dist = Uniform::new(self.len() / 4, 3 * self.len() / 4);
-        let pitch_dist = Uniform::new(-200, 200);
+        let pitch_dist = Uniform::new_inclusive(-200, 200);
         let amplitude_dist = Normal::new(1.0f32, 0.2).expect("normal distribution");
-        let false_seed_dist = Uniform::new(0, (target.len() - self.len()).max(1));
+        let duplicate_dist = Uniform::new_inclusive(1, 5);
         let mut rng = rand::thread_rng();
         (0..n).for_each(|_| match type_dist.sample(&mut rng) {
             0 => {
@@ -275,57 +279,69 @@ impl Sample {
                 *max_len = (*max_len).max(self.len() / 2);
             }
             2 => {
+                out.push(self.amplitude(amplitude_dist.sample(&mut rng).clamp(0.6, 1.5)));
+                *max_len = (*max_len).max(self.len());
+            }
+            3 => {
                 out.push(
                     self.pitch(pitch_dist.sample(&mut rng))
                         .truncate(target.len()),
                 );
                 *max_len = (*max_len).max(self.len());
             }
-            3 => {
-                out.push(self.amplitude(amplitude_dist.sample(&mut rng).clamp(0.6, 1.5)));
-                *max_len = (*max_len).max(self.len());
-            }
-            4 => out.push(Sample {
-                id: self.id,
-                signal: self.signal.clone(),
-                state: None,
-                seed: Some(false_seed_dist.sample(&mut rng) as _),
-                gain: self.gain,
-            }),
+            4 => out.append(&mut vec![self.duplicate(); duplicate_dist.sample(&mut rng)]),
             _ => unreachable!(),
         });
     }
 
-    fn add(&self, rhs: &Sample) -> Self {
+    fn add(&self, rhs: &Sample, delay: usize, mix: f32) -> Self {
         if self.len() >= rhs.len() {
             let left = self.signal[0]
                 .par_iter()
                 .enumerate()
-                .map(|(i, x)| (x + self.signal[0][i]) / 2.)
+                .map(|(i, x)| {
+                    if i >= delay && i < delay + rhs.len() {
+                        (1. - mix) * x + mix * rhs.signal[0][i - delay]
+                    } else {
+                        *x
+                    }
+                })
                 .collect();
             let right = self.signal[1]
                 .par_iter()
                 .enumerate()
-                .map(|(i, x)| (x + self.signal[1][i]) / 2.)
+                .map(|(i, x)| {
+                    if i >= delay && i < delay + rhs.len() {
+                        (1. - mix) * x + mix * rhs.signal[1][i - delay]
+                    } else {
+                        *x
+                    }
+                })
                 .collect();
             Sample {
                 id: self.id,
                 signal: [left, right],
                 state: None,
-                seed: self.state.map(|(x, _)| x),
-                gain: (self.gain + rhs.gain) / 2.,
+                gain: (1. - mix) * self.gain + mix * rhs.gain,
+                spect: None,
             }
         } else {
-            rhs.add(self)
+            rhs.add(self, 0, 1. - mix)
         }
     }
 
-    fn append(&self, mut other: Sample) -> Self {
-        let mut out = self.clone();
-        out.signal[0].append(&mut other.signal[0]);
-        out.signal[1].append(&mut other.signal[1]);
-        out.state = None;
-        out
+    fn append(&self, other: &Sample) -> Self {
+        let mut l = self.signal[0].clone();
+        l.append(&mut other.signal[0].clone());
+        let mut r = self.signal[1].clone();
+        r.append(&mut other.signal[1].clone());
+        Sample {
+            id: self.id,
+            signal: [l, r],
+            state: None,
+            gain: (self.gain + other.gain) / 2.,
+            spect: None,
+        }
     }
 
     fn truncate(&self, len: usize) -> Self {
@@ -336,176 +352,66 @@ impl Sample {
                 self.signal[1][..len.min(self.len())].to_vec(),
             ],
             state: None,
-            seed: self.state.map(|(x, _)| x),
             gain: self.gain,
+            spect: None,
         }
     }
 
-    fn skip_silence(&self) -> Self {
-        let mut left = vec![];
-        let mut right = vec![];
-
-        let mut start = 0;
-        let mut end = 0;
-        for (i, (l, r)) in self.signal[0].iter().zip(self.signal[1].iter()).enumerate() {
-            if l.abs() > f32::EPSILON || r.abs() > f32::EPSILON {
-                if i - end > secs_to_frames(SILENCE_TOLERANCE) {
-                    left.extend_from_slice(&self.signal[0][start..end]);
-                    right.extend_from_slice(&self.signal[1][start..end]);
-                    start = i;
-                }
-                end = i;
-            }
-        }
-
-        left.extend_from_slice(&self.signal[0][start..end]);
-        right.extend_from_slice(&self.signal[1][start..end]);
-
+    fn duplicate(&self) -> Self {
         Sample {
             id: self.id,
-            signal: [left, right],
+            signal: self.signal.clone(),
             state: None,
-            seed: self.state.map(|(x, _)| x),
             gain: self.gain,
+            spect: None,
         }
     }
 
-    fn xcorr(&mut self, planner: &Mutex<RealFftPlanner<f32>>, target: &Sample, ignore_seed: bool) {
-        // xcorr = ifft(fft(target) * conj(fft(self)))
-
-        if self.state.is_some() {
+    fn compute_spect(&mut self, max: usize) {
+        if self.spect.is_some() {
             return;
         }
 
-        // select smaller slice of target if seeded
-        let seed_region = if ignore_seed {
-            0..target.len()
-        } else {
-            self.seed
-                .map(|x| {
-                    (x as usize).saturating_sub(self.len())
-                        ..(x as usize + 2 * self.len()).min(target.len())
-                })
-                .unwrap_or(0..target.len())
-        };
+        let xbins = ((self.len() as f32 / max as f32) * SPECT_XBINS as f32) as usize;
 
-        // pad both signals
-        let padding = vec![0.; (seed_region.len() + self.len() - 1).next_power_of_two()];
-        let mut target_left = padding.clone();
-        target_left[..seed_region.len()].copy_from_slice(&target.signal[0][seed_region.clone()]);
-        let mut target_right = padding.clone();
-        target_right[..seed_region.len()].copy_from_slice(&target.signal[1][seed_region.clone()]);
-        let mut left = padding.clone();
-        left[..self.len()].copy_from_slice(&self.signal[0]);
-        let mut right = padding.clone();
-        right[..self.len()].copy_from_slice(&self.signal[1]);
+        self.spect = Some(
+            sonogram::SpecOptionsBuilder::new(xbins)
+                .load_data_from_memory_f32(self.signal[0].clone(), HZ)
+                .downsample(4)
+                .set_window_fn(sonogram::hann_function)
+                .build()
+                .expect("spectrogram")
+                .compute()
+                .to_buffer(sonogram::FrequencyScale::Log, xbins, SPECT_YBINS),
+        );
+    }
 
-        let fft = planner
-            .lock()
-            .expect("lock fft planner")
-            .plan_fft_forward(padding.len());
+    fn mse(&mut self, curr: &Sample, target: &Sample) {
+        // mse = 1/n * (target - self)^2
 
-        // fft(target)
-        let mut target_left_fft = fft.make_output_vec();
-        let mut target_right_fft = fft.make_output_vec();
-        fft.process(&mut target_left, &mut target_left_fft)
-            .expect("fft");
-        fft.process(&mut target_right, &mut target_right_fft)
-            .expect("fft");
+        let delay =
+            Uniform::new(0, (target.len() - self.len()).max(1)).sample(&mut rand::thread_rng());
 
-        std::mem::drop(target_left);
-        std::mem::drop(target_right);
-
-        // fft(self)
-        let mut left_fft = fft.make_output_vec();
-        let mut right_fft = fft.make_output_vec();
-        fft.process(&mut left, &mut left_fft).expect("fft");
-        fft.process(&mut right, &mut right_fft).expect("fft");
-
-        std::mem::drop(left);
-        std::mem::drop(right);
-
-        // conj([fft(self)]) * [fft(target)]
-        left_fft
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, x)| *x = x.conj() * target_left_fft[i]);
-        right_fft
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, x)| *x = x.conj() * target_right_fft[i]);
-
-        // ifft([conj(fft(self)) * fft(target)])
-        let ifft = planner
-            .lock()
-            .expect("lock fft planner")
-            .plan_fft_inverse(padding.len());
-        let mut left_ifft = ifft.make_output_vec();
-        let mut right_ifft = ifft.make_output_vec();
-        ifft.process(&mut left_fft, &mut left_ifft).expect("ifft");
-        ifft.process(&mut right_fft, &mut right_ifft).expect("ifft");
-
-        std::mem::drop(left_fft);
-        std::mem::drop(right_fft);
-
-        // find delay and value (signal dot product) of peak
-        let (l_delay, l_dot) = left_ifft[..seed_region.len()]
+        let mut next = curr.add(self, delay, OUTPUT_MIX);
+        next.compute_spect(target.len());
+        let mut sum = target
+            .spect
+            .as_ref()
+            .unwrap()
             .iter()
-            .enumerate()
-            .par_bridge()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(&b).unwrap())
-            .unwrap();
-        let (r_delay, r_dot) = right_ifft[..seed_region.len()]
-            .iter()
-            .enumerate()
-            .par_bridge()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(&b).unwrap())
-            .unwrap();
-        let l_delay = (seed_region.start + l_delay).clamp(0, target.len());
-        let r_delay = (seed_region.start + r_delay).clamp(0, target.len());
+            .zip(next.spect.as_ref().unwrap())
+            .map(|(a, b)| ((a - b) * (a - b)) as f64)
+            .sum::<f64>();
 
-        self.state = Some((((l_delay + r_delay) / 2) as _, (l_dot + r_dot) / 2.));
+        sum *= (1.
+            + (frames_to_secs(self.len()) - TARGET_SAMPLE_DURATION).abs() / TARGET_SAMPLE_DURATION)
+            as f64;
+
+        self.state = Some((delay as _, sum));
     }
-}
-
-fn range_intersects(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.contains(&b.start.saturating_sub(1))
-        || a.contains(&(b.end + 1))
-        || b.contains(&a.start.saturating_sub(1))
-        || b.contains(&(a.end + 1))
-}
-
-fn range_merge(ranges: &mut Vec<Range<usize>>) {
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut out: Vec<Range<usize>> = vec![];
-    for range in ranges.iter() {
-        if let Some(last) = out.last_mut() {
-            if range_intersects(last, range) {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-        }
-        out.push(range.clone());
-    }
-    *ranges = out;
-}
-
-fn range_overlap_perc(test: &Range<usize>, ranges: &[Range<usize>]) -> f32 {
-    let mut acc = 0;
-    for range in ranges {
-        if range_intersects(test, range) {
-            acc += test.end.min(range.end) - test.start.max(range.start);
-        }
-        if range.start > test.end {
-            break;
-        }
-    }
-    acc as f32 / test.len() as f32
 }
 
 fn main() {
-    assert!(TARGET_CHUNK_SECS > SAMPLE_CHUNK_SECS);
-
     // setup logging
     fern::Dispatch::new()
         .level(log::LevelFilter::Debug)
@@ -520,8 +426,8 @@ fn main() {
         .apply()
         .expect("log");
 
-    let target = Sample::from_wav("target.wav");
-    let planner = Mutex::new(RealFftPlanner::new());
+    let mut target = Sample::from_wav("target.wav");
+    target.compute_spect(target.len());
 
     let mut initial = read_dir("samples")
         .expect("read samples folder")
@@ -530,150 +436,125 @@ fn main() {
             file.file_type().unwrap().is_file() && file.path().extension().unwrap() == "wav"
         })
         .par_bridge()
-        .flat_map(|file| {
-            Sample::from_wav(file.path())
-                .skip_silence()
-                .chunked(secs_to_frames(SAMPLE_CHUNK_SECS))
-        })
+        .flat_map(|file| Sample::from_wav(file.path()).chunked(target.len()))
         .collect::<Vec<_>>();
     initial
         .iter_mut()
         .enumerate()
         .for_each(|(i, sample)| sample.id = i as _);
 
-    let out = target
-        .chunked(secs_to_frames(TARGET_CHUNK_SECS))
-        .into_iter()
-        .enumerate()
-        .map(|(i, target_chunk)| {
-            println!("Section {i}");
-            log::debug!("[[Section {}]]", i);
+    let mut all = initial.clone();
+    let mut out = Sample::new(target.len());
 
-            let mut all = initial.clone();
-            let mut out = Sample::new(target_chunk.len());
-            let mut out_mask = vec![];
+    let _ = std::fs::remove_dir_all("checkpoints");
+    std::fs::create_dir("checkpoints").expect("mkdir checkpoints");
 
-            for j in 0..GENERATIONS {
-                log::debug!("[Generation {}]", j);
-                log::debug!("{} samples", all.len());
+    for j in 0..GENERATIONS {
+        println!("Generation {}", j + 1);
+        log::debug!("[Generation {}]", j + 1);
 
-                // calculate and sort by fitness (descending)
-                all.par_iter_mut().for_each(|s| {
-                    s.xcorr(&planner, &target_chunk, j % SEED_RESET_MOD == 0);
+        if (j + 1) % HARD_RESET_GENERATION == 0 {
+            all = initial.clone();
+        } else if (j + 1) % SOFT_RESET_GENERATION == 0 {
+            all.append(&mut initial.clone());
+        }
 
-                    // scale by how much it covers untouched regions of output
-                    let delay = (s.state.unwrap().0 as usize).min(target_chunk.len() - s.len());
-                    s.state.as_mut().unwrap().1 /=
-                        range_overlap_perc(&(delay..delay + s.len()), &out_mask).max(0.005) * 2.;
-                });
-                all.par_sort_unstable_by(|a, b| {
-                    b.state.unwrap().1.partial_cmp(&a.state.unwrap().1).unwrap()
-                });
+        log::debug!("{} samples", all.len());
 
-                // take the best N samples and add to output
-                let mut out_count = 0;
-                let mut seen_delays: Vec<usize> = vec![];
-                for best in &all {
-                    if out_count == OUTPUT_CAPACITY {
-                        break;
-                    }
+        // calculate and sort by fitness
+        all = all
+            .into_par_iter()
+            .filter(|s| s.len() >= secs_to_frames(SAMPLE_MIN_SECS))
+            .collect();
+        all.par_iter_mut().for_each(|s| {
+            s.mse(&out, &target);
+        });
+        all.par_sort_unstable_by(|a, b| {
+            a.state.unwrap().1.partial_cmp(&b.state.unwrap().1).unwrap()
+        });
 
-                    let best_delay =
-                        (best.state.unwrap().0 as usize).min(target_chunk.len() - best.len());
+        // keep the best
+        all.iter()
+            .take(OUTPUT_CAPACITY.min(all.len()))
+            .rev()
+            .for_each(|best| {
+                let best_delay = (best.state.unwrap().0 as usize).min(target.len() - best.len());
+                out = out.add(best, best_delay, OUTPUT_MIX);
 
-                    // skip samples too close to other samples in this generation
-                    let mut skip = false;
-                    for seen in &seen_delays {
-                        if seen.abs_diff(best_delay) < secs_to_frames(NEARBY_DELAY_TOLERANCE) {
-                            skip = true;
-                            break;
-                        }
-                    }
-                    if skip {
-                        continue;
-                    }
-                    seen_delays.push(best_delay);
-                    out_count += 1;
-
-                    out.signal[0][best_delay..best_delay + best.len()]
-                        .par_iter_mut()
-                        .zip(best.signal[0].par_iter())
-                        .for_each(|(dst, src)| *dst = (*dst + *src) / 2.);
-                    out.signal[1][best_delay..best_delay + best.len()]
-                        .par_iter_mut()
-                        .zip(best.signal[1].par_iter())
-                        .for_each(|(dst, src)| *dst = (*dst + *src) / 2.);
-                    out_mask.push(best_delay..best_delay + best.len());
-
-                    log::debug!(
-                        "Output id {} with delay {}s, {}s",
-                        best.id,
-                        frames_to_secs(best_delay),
-                        frames_to_secs(best.len())
-                    );
-                }
-
-                range_merge(&mut out_mask);
-
-                // eliminate the weakest
-                let survival_count = ((all.len() as f32 * SURVIVAL_RATIO) as usize)
-                    .min(all.len())
-                    .min(GENERATION_CAPACITY);
-                all = all[..survival_count].to_vec();
-                log::debug!("{} samples survived", survival_count);
-
-                // transform
-                let mut max_len = 0;
-                let mut next = vec![];
-                all.iter().for_each(|sample| {
-                    sample.transforms(
-                        OFFSPRINGS_PER_SAMPLE,
-                        &target_chunk,
-                        &mut next,
-                        &mut max_len,
-                    );
-                });
-
-                let mutation_count = next.len();
-                log::debug!("{} mutations generated", next.len());
-
-                // crossovers
-                let mut rng = rand::thread_rng();
-                let crossover_count = (all.len() as f32 * CROSSOVER_RATIO) as usize;
-                let crossover_dist = Uniform::new(0, all.len());
-                next.extend(
-                    crossover_dist
-                        .sample_iter(&mut rng)
-                        .take(crossover_count)
-                        .map(|k| all[k].add(&all[crossover_dist.sample(&mut rand::thread_rng())])),
+                log::debug!(
+                    "Output id {} with delay {}s, {}s",
+                    best.id,
+                    frames_to_secs(best_delay),
+                    frames_to_secs(best.len())
                 );
+            });
 
-                log::debug!("{} crossovers generated", next.len() - mutation_count);
+        if (j + 1) % 10 == 0 {
+            out.save_to_wav(format!("checkpoints/G{}.wav", j + 1));
+        }
 
-                // elitism
-                let elite_count = (all.len() as f32
-                    * ELITISM_RATIO
-                    * 2f32.powf(ELITISM_COEFF * (j as f32 / GENERATIONS as f32) - ELITISM_COEFF)
-                        as f32) as usize;
-                let elitism_dist = Triangular::new(0.0f32, all.len() as f32, 0.0f32)
-                    .expect("triangular distribution");
-                next.extend(
-                    elitism_dist
-                        .sample_iter(&mut rng)
-                        .take(elite_count)
-                        .map(|k| all[k as usize].clone()),
-                );
+        log::debug!(
+            "Best score: {}, worst score: {}",
+            all[0].state.unwrap().1,
+            all.last().unwrap().state.unwrap().1
+        );
 
-                log::debug!("{} samples kept as elites", elite_count);
-                log::debug!("");
+        // eliminate the weakest
+        let survival_count = ((all.len() as f32 * SURVIVAL_RATIO) as usize)
+            .min(all.len())
+            .min(GENERATION_CAPACITY);
+        all = all[..survival_count].to_vec();
+        log::debug!("{} samples survived", survival_count);
 
-                all = next;
-            }
+        // transform
+        let mut max_len = 0;
+        let mut next = vec![];
+        all.iter().for_each(|sample| {
+            sample.transforms(OFFSPRINGS_PER_SAMPLE, &target, &mut next, &mut max_len);
+        });
 
-            out.save_to_wav(format!("out_s{i}.wav"));
-            out
-        })
-        .fold(Sample::new(0), |out, chunk| out.append(chunk));
+        let mutation_count = next.len();
+        log::debug!("{} mutations generated", next.len());
+
+        // crossovers
+        let mut rng = rand::thread_rng();
+        let crossover_count = (all.len() as f32 * CROSSOVER_RATIO) as usize;
+        let crossover_dist = Uniform::new(0, all.len());
+        next.extend(
+            crossover_dist
+                .sample_iter(&mut rng)
+                .take(crossover_count)
+                .map(|k| {
+                    let mut rng = rand::thread_rng();
+                    match Uniform::new(0, 2).sample(&mut rng) {
+                        0 => all[k].add(&all[crossover_dist.sample(&mut rng)], 0, 0.5),
+                        1 => all[k].append(&all[crossover_dist.sample(&mut rng)]),
+                        _ => unreachable!(),
+                    }
+                }),
+        );
+
+        log::debug!("{} crossovers generated", next.len() - mutation_count);
+
+        // elitism
+        let elite_count = (all.len() as f32
+            * ELITISM_RATIO
+            * 2f32.powf(ELITISM_COEFF * (j as f32 / GENERATIONS as f32) - ELITISM_COEFF) as f32)
+            as usize;
+        let elitism_dist =
+            Triangular::new(0.0f32, all.len() as f32, 0.0f32).expect("triangular distribution");
+        next.extend(
+            elitism_dist
+                .sample_iter(&mut rng)
+                .take(elite_count)
+                .map(|k| all[k as usize].clone()),
+        );
+
+        log::debug!("{} samples kept as elites", elite_count);
+        log::debug!("");
+
+        all = next;
+    }
 
     out.save_to_wav("out.wav");
 }
