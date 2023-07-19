@@ -1,63 +1,41 @@
 use itertools::Itertools;
-use rand_distr::{Distribution, Normal, Triangular, Uniform};
-use rayon::{
-    prelude::{
-        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-        IntoParallelRefMutIterator, ParallelBridge, ParallelIterator,
-    },
-    slice::ParallelSliceMut,
-};
+use rand_distr::{Distribution, Normal, Uniform};
 use rubato::{FftFixedInOut, Resampler};
 use std::{
     fs::{read_dir, File},
+    io::Write,
     path::Path,
 };
 
 // Sampling rate of the audio while the genetic algorithm runs.
 // Lower values will be much faster but will yield lower final audio fidelity.
-const HZ: u32 = 20000;
-// Minimum duration of a sample.
-const SAMPLE_MIN_SECS: f32 = 0.2;
-// How many generations will run. More generations means reaching a better fitting solution.
-const GENERATIONS: u32 = 500;
-// Each N generations the initial population will be mixed in to add variety.
-const SOFT_RESET_GENERATION: u32 = 25;
-// Each N generations the population is reset to the initial population to escape local optima.
-const HARD_RESET_GENERATION: u32 = 100;
+const HZ: u32 = 48000;
+// How many cycles will run.
+const CYCLES: u32 = 500;
+// The min number of generations that will run per cycle.
+const GENERATION_MIN: u32 = 1;
+// The max number of generations that will run per cycle. This prevents run-off cycles that dig themselves into a hole of worse-than-before solutions.
+const GENERATION_MAX: u32 = 7;
 // This is how many offspring each sample will create (not taking into account two offspring per one split transformation).
 const OFFSPRINGS_PER_SAMPLE: usize = 5;
 // The max number of samples that can ever survive from one generation. Take this as the overpopulation threshold.
-const GENERATION_CAPACITY: usize = 1000;
+const GENERATION_CAPACITY: usize = 500;
 // The top N samples are added to the output signal.
 const OUTPUT_CAPACITY: usize = 10;
-// Ratio of mix between current output and selected samples. 0.5 means each selected sample is average with the current output signal.
-const OUTPUT_MIX: f32 = 0.9;
 // The top percentile of population that survive to transform/crossover.
-const SURVIVAL_RATIO: f32 = 0.5;
+const SURVIVAL_RATIO: f32 = 0.3;
 // Percentage of surviving population that is chosen (at random) to be crossed over (signals added together).
 const CROSSOVER_RATIO: f32 = 0.1;
-// What is the ideal duration of a sample?
-// Samples deviating from this duration (in seconds) will have their score scaled down.
-const TARGET_SAMPLE_DURATION: f32 = 0.7;
-
-// The number of elites selected per generation is calculated as
-//      population_count * ELITISM_RATIO * 2^(ELITISM_COEFF * (generation / total_generations) - ELITISM_COEFF)
-// This is so that it can "ramp up" as we approach the end of our generation.
-
-// Thew highest percentage of elitism possible.
-// Essentially, on the very last generation, this is the percent of the population that will be taken as elites.
-// It's recommended that if you're running a low number of generations, that this be equal or very close to 0.
-const ELITISM_RATIO: f32 = 0.1;
-// How much the elitism is scaled through the generations.
-// The higher this number is, the more delayed elitism will be.
-// Must be >= 0. To disable "dynamic elitism", set this value to 0 and the elitism ratio will remain constant through every generation.
-const ELITISM_COEFF: f32 = 10.0;
+// What is the BPM of the target?
+const TARGET_BPM: f32 = 115.0;
+// 0-1, amount of rhythm
+const I_GOT_RHYTHM: f32 = 1.0;
 
 // Number of bins of the spectrogram on the x-axis.
 // Longer target audios may need more bins for better time resolution.
-const SPECT_XBINS: usize = 2048;
+const SPECT_XBINS: usize = 256;
 // Number of bins of the spectrogram on the y-axis
-const SPECT_YBINS: usize = 256;
+const SPECT_YBINS: usize = 64;
 
 fn freq_pitch(cents: i32) -> u32 {
     (2.0f32.powf(cents as f32 / 1200.0) * HZ as f32) as _
@@ -71,11 +49,15 @@ fn frames_to_secs(frames: usize) -> f32 {
     frames as f32 / HZ as f32
 }
 
+fn bpm_to_frames(bpm: f32) -> usize {
+    secs_to_frames(60. / bpm)
+}
+
 #[derive(Clone)]
 struct Sample {
     pub id: u64,
     pub signal: [Vec<f32>; 2], // stereo
-    pub state: Option<(u32, f64)>,
+    pub state: Option<(u32, f64, f32)>,
     pub gain: f32,
     pub spect: Option<Vec<f32>>,
 }
@@ -99,6 +81,11 @@ impl Sample {
                 .into_iter()
                 .map(|sample| sample as f32 / 0x8000 as f32)
                 .collect::<Vec<_>>(),
+            wav::BitDepth::Eight(samples) => samples
+                .into_iter()
+                .map(|sample| sample as f32 / 0xFF as f32)
+                .collect::<Vec<_>>(),
+            wav::BitDepth::ThirtyTwoFloat(samples) => samples,
             _ => unimplemented!(),
         };
         let (l, r) = interleaved.chunks(2).map(|x| (x[0], x[1])).unzip();
@@ -251,8 +238,8 @@ impl Sample {
             };
         }
 
-        let left = self.signal[0].par_iter().map(|x| x * ratio).collect();
-        let right = self.signal[1].par_iter().map(|x| x * ratio).collect();
+        let left = self.signal[0].iter().map(|x| x * ratio).collect();
+        let right = self.signal[1].iter().map(|x| x * ratio).collect();
         Sample {
             id: self.id,
             signal: [left, right],
@@ -263,11 +250,12 @@ impl Sample {
     }
 
     fn transforms(&self, n: usize, target: &Sample, out: &mut Vec<Sample>, max_len: &mut usize) {
-        let type_dist = Uniform::new_inclusive(0, 4);
+        let type_dist = Uniform::new_inclusive(0, 5);
         let split_dist = Uniform::new(self.len() / 4, 3 * self.len() / 4);
         let pitch_dist = Uniform::new_inclusive(-200, 200);
         let amplitude_dist = Normal::new(1.0f32, 0.2).expect("normal distribution");
-        let duplicate_dist = Uniform::new_inclusive(1, 5);
+        let duplicate_dist = Uniform::new_inclusive(1, 3);
+        let chunk_dist = Uniform::new_inclusive(self.len() / 8, self.len() / 3);
         let mut rng = rand::thread_rng();
         (0..n).for_each(|_| match type_dist.sample(&mut rng) {
             0 => {
@@ -290,14 +278,21 @@ impl Sample {
                 *max_len = (*max_len).max(self.len());
             }
             4 => out.append(&mut vec![self.duplicate(); duplicate_dist.sample(&mut rng)]),
+            5 => out.append(
+                &mut self.chunked(
+                    chunk_dist
+                        .sample(&mut rng)
+                        .max(secs_to_frames(0.2).min(self.len())),
+                ),
+            ),
             _ => unreachable!(),
         });
     }
 
-    fn add(&self, rhs: &Sample, delay: usize, mix: f32) -> Self {
-        if self.len() >= rhs.len() {
+    fn add(&self, rhs: &Sample, delay: usize, mix: f32, trunc: bool) -> Self {
+        if self.len() >= rhs.len() || trunc {
             let left = self.signal[0]
-                .par_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, x)| {
                     if i >= delay && i < delay + rhs.len() {
@@ -308,7 +303,7 @@ impl Sample {
                 })
                 .collect();
             let right = self.signal[1]
-                .par_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, x)| {
                     if i >= delay && i < delay + rhs.len() {
@@ -326,7 +321,7 @@ impl Sample {
                 spect: None,
             }
         } else {
-            rhs.add(self, 0, 1. - mix)
+            rhs.add(self, 0, 1. - mix, true)
         }
     }
 
@@ -367,47 +362,51 @@ impl Sample {
         }
     }
 
-    fn compute_spect(&mut self, max: usize) {
+    fn compute_spect(&mut self) {
         if self.spect.is_some() {
             return;
         }
 
-        let xbins = ((self.len() as f32 / max as f32) * SPECT_XBINS as f32) as usize;
-
         self.spect = Some(
-            sonogram::SpecOptionsBuilder::new(xbins)
+            sonogram::SpecOptionsBuilder::new(SPECT_XBINS)
                 .load_data_from_memory_f32(self.signal[0].clone(), HZ)
                 .downsample(4)
                 .set_window_fn(sonogram::hann_function)
                 .build()
                 .expect("spectrogram")
                 .compute()
-                .to_buffer(sonogram::FrequencyScale::Log, xbins, SPECT_YBINS),
+                .to_buffer(sonogram::FrequencyScale::Log, SPECT_XBINS, SPECT_YBINS),
         );
     }
 
-    fn mse(&mut self, curr: &Sample, target: &Sample) {
-        // mse = 1/n * (target - self)^2
-
-        let delay =
-            Uniform::new(0, (target.len() - self.len()).max(1)).sample(&mut rand::thread_rng());
-
-        let mut next = curr.add(self, delay, OUTPUT_MIX);
-        next.compute_spect(target.len());
-        let mut sum = target
-            .spect
+    fn mse(a: &Sample, b: &Sample) -> f64 {
+        a.spect
             .as_ref()
             .unwrap()
             .iter()
-            .zip(next.spect.as_ref().unwrap())
+            .zip(b.spect.as_ref().unwrap())
             .map(|(a, b)| ((a - b) * (a - b)) as f64)
-            .sum::<f64>();
+            .sum::<f64>()
+    }
 
-        sum *= (1.
-            + (frames_to_secs(self.len()) - TARGET_SAMPLE_DURATION).abs() / TARGET_SAMPLE_DURATION)
-            as f64;
+    fn compute_state(&mut self, curr: &Sample, target: &Sample, delay: Option<usize>) {
+        // mse = 1/n * (target - self)^2
 
-        self.state = Some((delay as _, sum));
+        let delay = delay.unwrap_or_else(|| {
+            let pick = Uniform::new(0, (target.len() - self.len()).max(1))
+                .sample(&mut rand::thread_rng()) as f64;
+            let on_time = (pick as f64 / bpm_to_frames(TARGET_BPM) as f64).round()
+                * bpm_to_frames(TARGET_BPM) as f64;
+            (pick * (1. - I_GOT_RHYTHM as f64) + on_time * I_GOT_RHYTHM as f64) as _
+        });
+
+        let mix = Uniform::new(0.5, 1.0).sample(&mut rand::thread_rng());
+
+        let mut next = curr.add(self, delay, mix, true);
+        next.compute_spect();
+        let sum = Sample::mse(&next, &target);
+
+        self.state = Some((delay as _, sum, mix));
     }
 }
 
@@ -427,7 +426,7 @@ fn main() {
         .expect("log");
 
     let mut target = Sample::from_wav("target.wav");
-    target.compute_spect(target.len());
+    target.compute_spect();
 
     let mut initial = read_dir("samples")
         .expect("read samples folder")
@@ -435,7 +434,6 @@ fn main() {
         .filter(|file| {
             file.file_type().unwrap().is_file() && file.path().extension().unwrap() == "wav"
         })
-        .par_bridge()
         .flat_map(|file| Sample::from_wav(file.path()).chunked(target.len()))
         .collect::<Vec<_>>();
     initial
@@ -443,54 +441,150 @@ fn main() {
         .enumerate()
         .for_each(|(i, sample)| sample.id = i as _);
 
-    let mut all = initial.clone();
     let mut out = Sample::new(target.len());
 
     let _ = std::fs::remove_dir_all("checkpoints");
     std::fs::create_dir("checkpoints").expect("mkdir checkpoints");
 
-    for j in 0..GENERATIONS {
-        println!("Generation {}", j + 1);
-        log::debug!("[Generation {}]", j + 1);
+    out.compute_spect();
+    let mut last_score = Sample::mse(&out, &target);
+    let first_score = last_score;
 
-        if (j + 1) % HARD_RESET_GENERATION == 0 {
-            all = initial.clone();
-        } else if (j + 1) % SOFT_RESET_GENERATION == 0 {
-            all.append(&mut initial.clone());
-        }
+    let mut max_cycles = CYCLES;
+    for i in 0..max_cycles {
+        println!("Cycle {}", i + 1);
+        log::debug!("[Cycle {}]", i + 1);
 
-        log::debug!("{} samples", all.len());
+        let sort = |mut all: Vec<Sample>| {
+            // calculate and sort by fitness
+            all = all
+                .into_iter()
+                .filter(|s| s.len() >= secs_to_frames(0.2))
+                .collect();
+            all.iter_mut().for_each(|s| {
+                s.compute_state(&out, &target, None);
+            });
+            all.sort_unstable_by(|a, b| {
+                a.state.unwrap().1.partial_cmp(&b.state.unwrap().1).unwrap()
+            });
+            all
+        };
 
-        // calculate and sort by fitness
-        all = all
-            .into_par_iter()
-            .filter(|s| s.len() >= secs_to_frames(SAMPLE_MIN_SECS))
-            .collect();
-        all.par_iter_mut().for_each(|s| {
-            s.mse(&out, &target);
-        });
-        all.par_sort_unstable_by(|a, b| {
-            a.state.unwrap().1.partial_cmp(&b.state.unwrap().1).unwrap()
-        });
+        let eliminate = |mut all: Vec<Sample>| {
+            // eliminate the weakest
+            let survival_count = ((all.len() as f32 * SURVIVAL_RATIO) as usize)
+                .min(all.len())
+                .min(GENERATION_CAPACITY);
+            all = all[..survival_count].to_vec();
+            log::debug!("{} samples survived", survival_count);
+            all
+        };
 
-        // keep the best
-        all.iter()
-            .take(OUTPUT_CAPACITY.min(all.len()))
-            .rev()
-            .for_each(|best| {
-                let best_delay = (best.state.unwrap().0 as usize).min(target.len() - best.len());
-                out = out.add(best, best_delay, OUTPUT_MIX);
-
-                log::debug!(
-                    "Output id {} with delay {}s, {}s",
-                    best.id,
-                    frames_to_secs(best_delay),
-                    frames_to_secs(best.len())
-                );
+        let mutate = |mut all: Vec<Sample>| {
+            // transform
+            let mut max_len = 0;
+            let mut next = vec![];
+            all.iter().for_each(|sample| {
+                sample.transforms(OFFSPRINGS_PER_SAMPLE, &target, &mut next, &mut max_len);
             });
 
-        if (j + 1) % 10 == 0 {
-            out.save_to_wav(format!("checkpoints/G{}.wav", j + 1));
+            let mutation_count = next.len();
+            log::debug!("{} mutations generated", next.len());
+
+            // crossovers
+            let mut rng = rand::thread_rng();
+            let crossover_count = (all.len() as f32 * CROSSOVER_RATIO) as usize;
+            let crossover_dist = Uniform::new(0, all.len());
+            next.extend(
+                crossover_dist
+                    .sample_iter(&mut rng)
+                    .take(crossover_count)
+                    .map(|k| {
+                        let mut rng = rand::thread_rng();
+                        match Uniform::new(0, 2).sample(&mut rng) {
+                            0 => all[k].add(&all[crossover_dist.sample(&mut rng)], 0, 0.5, false),
+                            1 => all[k].append(&all[crossover_dist.sample(&mut rng)]),
+                            _ => unreachable!(),
+                        }
+                    }),
+            );
+
+            log::debug!("{} crossovers generated", next.len() - mutation_count);
+            log::debug!("");
+
+            all.append(&mut next);
+            all
+        };
+
+        let write = |all: &[Sample], out: &mut Sample, write_log: bool| {
+            all.iter()
+                .take(OUTPUT_CAPACITY.min(all.len()))
+                .rev()
+                .for_each(|best| {
+                    let (delay, mix) = best
+                        .state
+                        .map(|(delay, _, mix)| {
+                            ((delay as usize).min(target.len() - best.len()), mix)
+                        })
+                        .unwrap();
+                    *out = out.add(best, delay, mix, true);
+
+                    if write_log {
+                        log::debug!(
+                            "Output id {} with delay {}s, {}s, mix {}",
+                            best.id,
+                            frames_to_secs(delay),
+                            frames_to_secs(best.len()),
+                            mix,
+                        );
+                    }
+                });
+        };
+
+        let mut all = initial.clone();
+
+        all = mutate(all);
+        let mut best_score;
+        let mut j = 0;
+        while {
+            print!("Gen {}, ", j + 1);
+            std::io::stdout().flush().unwrap();
+            log::debug!("[Generation {}]", j + 1);
+            log::debug!("{} samples", all.len());
+
+            all = eliminate(sort(all));
+
+            let mut scored = out.clone();
+            write(&all, &mut scored, false);
+            scored.compute_spect();
+            best_score = Sample::mse(&scored, &target);
+
+            all = mutate(all);
+
+            j += 1;
+            j < GENERATION_MIN || (j < GENERATION_MAX && best_score > last_score)
+        } {}
+
+        if best_score > last_score {
+            println!("... Regressed\n");
+            max_cycles += 1;
+            continue;
+        }
+
+        all = sort(all);
+        println!();
+
+        // keep the best
+        write(&all, &mut out, true);
+
+        out.spect = None;
+        out.compute_spect();
+        last_score = Sample::mse(&out, &target);
+
+        println!("{:.2}%", 100. * (1. - last_score / first_score));
+
+        if (i + 1) % 10 == 0 {
+            out.save_to_wav(format!("checkpoints/C{}.wav", i + 1));
         }
 
         log::debug!(
@@ -498,62 +592,6 @@ fn main() {
             all[0].state.unwrap().1,
             all.last().unwrap().state.unwrap().1
         );
-
-        // eliminate the weakest
-        let survival_count = ((all.len() as f32 * SURVIVAL_RATIO) as usize)
-            .min(all.len())
-            .min(GENERATION_CAPACITY);
-        all = all[..survival_count].to_vec();
-        log::debug!("{} samples survived", survival_count);
-
-        // transform
-        let mut max_len = 0;
-        let mut next = vec![];
-        all.iter().for_each(|sample| {
-            sample.transforms(OFFSPRINGS_PER_SAMPLE, &target, &mut next, &mut max_len);
-        });
-
-        let mutation_count = next.len();
-        log::debug!("{} mutations generated", next.len());
-
-        // crossovers
-        let mut rng = rand::thread_rng();
-        let crossover_count = (all.len() as f32 * CROSSOVER_RATIO) as usize;
-        let crossover_dist = Uniform::new(0, all.len());
-        next.extend(
-            crossover_dist
-                .sample_iter(&mut rng)
-                .take(crossover_count)
-                .map(|k| {
-                    let mut rng = rand::thread_rng();
-                    match Uniform::new(0, 2).sample(&mut rng) {
-                        0 => all[k].add(&all[crossover_dist.sample(&mut rng)], 0, 0.5),
-                        1 => all[k].append(&all[crossover_dist.sample(&mut rng)]),
-                        _ => unreachable!(),
-                    }
-                }),
-        );
-
-        log::debug!("{} crossovers generated", next.len() - mutation_count);
-
-        // elitism
-        let elite_count = (all.len() as f32
-            * ELITISM_RATIO
-            * 2f32.powf(ELITISM_COEFF * (j as f32 / GENERATIONS as f32) - ELITISM_COEFF) as f32)
-            as usize;
-        let elitism_dist =
-            Triangular::new(0.0f32, all.len() as f32, 0.0f32).expect("triangular distribution");
-        next.extend(
-            elitism_dist
-                .sample_iter(&mut rng)
-                .take(elite_count)
-                .map(|k| all[k as usize].clone()),
-        );
-
-        log::debug!("{} samples kept as elites", elite_count);
-        log::debug!("");
-
-        all = next;
     }
 
     out.save_to_wav("out.wav");
