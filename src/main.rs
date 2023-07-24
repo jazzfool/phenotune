@@ -1,52 +1,49 @@
-use itertools::Itertools;
+mod stereo;
+
 use rand_distr::{Distribution, Normal, Uniform};
-use rubato::{FftFixedInOut, Resampler};
-use std::{
-    fs::{read_dir, File},
-    io::Write,
-    path::Path,
-};
+use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
+use regex::Regex;
+use std::{fs::read_dir, io::Write, path::Path, rc::Rc};
+use stereo::*;
 
 // Sampling rate of the audio while the genetic algorithm runs.
 // Lower values will be much faster but will yield lower final audio fidelity.
-const HZ: u32 = 48000;
+const HZ: u32 = 44100;
 // How many cycles will run.
 const CYCLES: u32 = 500;
 // The min number of generations that will run per cycle.
 const GENERATION_MIN: u32 = 1;
 // The max number of generations that will run per cycle. This prevents run-off cycles that dig themselves into a hole of worse-than-before solutions.
-const GENERATION_MAX: u32 = 7;
+const GENERATION_MAX: u32 = 6;
+// Initial population size per cycle, chosen at random from the loaded samples.
+const INITIAL_POPULATION: usize = 100;
 // This is how many offspring each sample will create (not taking into account two offspring per one split transformation).
 const OFFSPRINGS_PER_SAMPLE: usize = 5;
 // The max number of samples that can ever survive from one generation. Take this as the overpopulation threshold.
 const GENERATION_CAPACITY: usize = 500;
 // The top N samples are added to the output signal.
 const OUTPUT_CAPACITY: usize = 10;
-// The top percentile of population that survive to transform/crossover.
-const SURVIVAL_RATIO: f32 = 0.3;
 // Percentage of surviving population that is chosen (at random) to be crossed over (signals added together).
-const CROSSOVER_RATIO: f32 = 0.1;
+const CROSSOVER_RATIO: f32 = 0.2;
+// The top percentile of population that survive to transform/crossover.
+const SURVIVAL_RATIO: f32 = 0.4;
+// 0-1, amount of rhythm.
+const I_GOT_RHYTHM: f32 = 0.8;
 // What is the BPM of the target?
-const TARGET_BPM: f32 = 115.0;
-// 0-1, amount of rhythm
-const I_GOT_RHYTHM: f32 = 1.0;
+const TARGET_BPM: f32 = 160.;
+// Should very short samples be filtered from the population? Disable if doing a percussion pass.
+const FILTER_SHORT: bool = false;
+// Should regression on subsequent cycles be permitted (once the generation max is hit)?
+const ALLOW_REGRESSION: bool = false;
 
 // Number of bins of the spectrogram on the x-axis.
 // Longer target audios may need more bins for better time resolution.
-const SPECT_XBINS: usize = 256;
+const SPECT_XBINS: usize = 1600;
 // Number of bins of the spectrogram on the y-axis
-const SPECT_YBINS: usize = 64;
-
-fn freq_pitch(cents: i32) -> u32 {
-    (2.0f32.powf(cents as f32 / 1200.0) * HZ as f32) as _
-}
+const SPECT_YBINS: usize = 256;
 
 fn secs_to_frames(secs: f32) -> usize {
     (HZ as f32 * secs) as _
-}
-
-fn frames_to_secs(frames: usize) -> f32 {
-    frames as f32 / HZ as f32
 }
 
 fn bpm_to_frames(bpm: f32) -> usize {
@@ -54,360 +51,197 @@ fn bpm_to_frames(bpm: f32) -> usize {
 }
 
 #[derive(Clone)]
-struct Sample {
-    pub id: u64,
-    pub signal: [Vec<f32>; 2], // stereo
-    pub state: Option<(u32, f64, f32)>,
-    pub gain: f32,
-    pub spect: Option<Vec<f32>>,
+enum Fx<'a> {
+    Reverse,
+    Gain(f32),
+    Pitch(i32),
+    Add(Sample<'a>, usize, f32),
+    Append(Sample<'a>),
+    Repeat(usize),
+    Shelf { low: bool, gain: f32, cutoff: u32 },
 }
 
-impl Sample {
-    fn new(len: usize) -> Self {
+#[derive(Clone)]
+struct Sample<'a> {
+    pub id: u64,
+    pub signal: StereoRef<'a>,
+    pub fx: Vec<Fx<'a>>,
+    pub state: Option<(u32, f32, f32)>,
+}
+
+impl<'a> Sample<'a> {
+    fn new(signal: StereoRef<'a>) -> Self {
         Sample {
             id: 0,
-            signal: [vec![0.; len], vec![0.; len]],
+            signal,
+            fx: vec![],
             state: None,
-            gain: 1.,
-            spect: None,
         }
-    }
-
-    fn from_wav(file: impl AsRef<Path>) -> Self {
-        let mut file = File::open(file).expect("read file");
-        let (header, data) = wav::read(&mut file).expect("decode wav");
-        let interleaved = match data {
-            wav::BitDepth::Sixteen(samples) => samples
-                .into_iter()
-                .map(|sample| sample as f32 / 0x8000 as f32)
-                .collect::<Vec<_>>(),
-            wav::BitDepth::Eight(samples) => samples
-                .into_iter()
-                .map(|sample| sample as f32 / 0xFF as f32)
-                .collect::<Vec<_>>(),
-            wav::BitDepth::ThirtyTwoFloat(samples) => samples,
-            _ => unimplemented!(),
-        };
-        let (l, r) = interleaved.chunks(2).map(|x| (x[0], x[1])).unzip();
-        Sample {
-            id: 0,
-            signal: [l, r],
-            state: None,
-            gain: 1.,
-            spect: None,
-        }
-        .resample(header.sampling_rate, HZ)
-    }
-
-    fn save_to_wav(&self, file: impl AsRef<Path>) {
-        let mut file = File::create(file).expect("write file");
-        wav::write(
-            wav::Header::new(wav::WAV_FORMAT_PCM, 2, HZ, 16),
-            &wav::BitDepth::Sixteen(
-                self.signal[0]
-                    .iter()
-                    .interleave(self.signal[1].iter())
-                    .map(|x| (x.clamp(-1., 1.) * 0x8000 as f32) as i16)
-                    .collect(),
-            ),
-            &mut file,
-        )
-        .expect("encode wav");
     }
 
     fn len(&self) -> usize {
         self.signal[0].len()
     }
 
-    fn chunked(&self, frames: usize) -> Vec<Self> {
-        self.signal[0]
-            .chunks(frames)
-            .zip(self.signal[1].chunks(frames))
-            .map(|(l, r)| Sample {
-                id: 0,
-                signal: [l.to_vec(), r.to_vec()],
-                state: None,
-                gain: self.gain,
-                spect: None,
-            })
-            .collect()
-    }
-
-    fn resample(&self, f1: u32, f2: u32) -> Self {
-        const CHUNK_SIZE: usize = 2048;
-
-        if f1 == f2 {
-            return self.clone();
-        }
-
-        let mut resampler =
-            FftFixedInOut::new(f1 as _, f2 as _, CHUNK_SIZE, 2).expect("init resampler");
-        let mut left_out = vec![];
-        left_out.reserve(resampler.output_frames_max());
-        let mut right_out = vec![];
-        right_out.reserve(resampler.output_frames_max());
-
-        let mut remaining = self.signal[0].len();
-        let mut next_frames = resampler.input_frames_next();
-        while remaining > next_frames {
-            let mut out = resampler
-                .process(
-                    &[
-                        &self.signal[0][self.signal[0].len() - remaining..],
-                        &self.signal[1][self.signal[1].len() - remaining..],
-                    ],
-                    None,
-                )
-                .expect("resample");
-            left_out.append(&mut out[0]);
-            right_out.append(&mut out[1]);
-            remaining -= next_frames;
-            next_frames = resampler.input_frames_next();
-        }
-
-        if remaining > 0 {
-            let mut out = resampler
-                .process_partial(
-                    Some(&[
-                        &self.signal[0][self.signal[0].len() - remaining..],
-                        &self.signal[1][self.signal[1].len() - remaining..],
-                    ]),
-                    None,
-                )
-                .expect("resample");
-            left_out.append(&mut out[0]);
-            right_out.append(&mut out[1]);
-        }
-
+    fn with_fx(&self, new_fx: Fx<'a>) -> Self {
+        let mut fx = self.fx.clone();
+        fx.push(new_fx);
         Sample {
             id: self.id,
-            signal: [left_out, right_out],
+            signal: self.signal.clone(),
+            fx,
             state: None,
-            gain: self.gain,
-            spect: None,
-        }
-    }
-
-    fn reverse(&self) -> Self {
-        let mut out = self.signal.clone();
-        out.reverse();
-        Sample {
-            id: self.id,
-            signal: out,
-            state: None,
-            gain: self.gain,
-            spect: None,
         }
     }
 
     fn split(&self, at: usize) -> [Self; 2] {
-        let ((a_left, b_left), (a_right, b_right)) =
-            (self.signal[0].split_at(at), self.signal[1].split_at(at));
+        let [a, b] = split(self.signal, at);
         [
             Sample {
                 id: self.id,
-                signal: [a_left.to_vec(), a_right.to_vec()],
+                signal: a,
+                fx: self.fx.clone(),
                 state: None,
-                gain: self.gain,
-                spect: None,
             },
             Sample {
                 id: self.id,
-                signal: [b_left.to_vec(), b_right.to_vec()],
+                signal: b,
+                fx: self.fx.clone(),
                 state: None,
-                gain: self.gain,
-                spect: None,
             },
         ]
     }
 
-    fn pitch(&self, cents: i32) -> Self {
-        self.resample(HZ, freq_pitch(cents))
-    }
-
-    fn amplitude(&self, ratio: f32) -> Self {
-        let ratio = (self.gain * ratio).clamp(0.6, 1.5) / self.gain;
-
-        if (self.gain * ratio - self.gain).abs() < f32::EPSILON {
-            return Sample {
+    fn chunked(&self, frames: usize) -> Vec<Self> {
+        chunked(self.signal, frames)
+            .into_iter()
+            .map(|signal| Sample {
                 id: self.id,
-                signal: self.signal.clone(),
+                signal,
+                fx: self.fx.clone(),
                 state: None,
-                gain: self.gain,
-                spect: None,
-            };
-        }
-
-        let left = self.signal[0].iter().map(|x| x * ratio).collect();
-        let right = self.signal[1].iter().map(|x| x * ratio).collect();
-        Sample {
-            id: self.id,
-            signal: [left, right],
-            state: None,
-            gain: self.gain * ratio,
-            spect: None,
-        }
-    }
-
-    fn transforms(&self, n: usize, target: &Sample, out: &mut Vec<Sample>, max_len: &mut usize) {
-        let type_dist = Uniform::new_inclusive(0, 5);
-        let split_dist = Uniform::new(self.len() / 4, 3 * self.len() / 4);
-        let pitch_dist = Uniform::new_inclusive(-200, 200);
-        let amplitude_dist = Normal::new(1.0f32, 0.2).expect("normal distribution");
-        let duplicate_dist = Uniform::new_inclusive(1, 3);
-        let chunk_dist = Uniform::new_inclusive(self.len() / 8, self.len() / 3);
-        let mut rng = rand::thread_rng();
-        (0..n).for_each(|_| match type_dist.sample(&mut rng) {
-            0 => {
-                out.push(self.reverse());
-                *max_len = (*max_len).max(self.len());
-            }
-            1 => {
-                out.extend_from_slice(&self.split(split_dist.sample(&mut rng)));
-                *max_len = (*max_len).max(self.len() / 2);
-            }
-            2 => {
-                out.push(self.amplitude(amplitude_dist.sample(&mut rng).clamp(0.6, 1.5)));
-                *max_len = (*max_len).max(self.len());
-            }
-            3 => {
-                out.push(
-                    self.pitch(pitch_dist.sample(&mut rng))
-                        .truncate(target.len()),
-                );
-                *max_len = (*max_len).max(self.len());
-            }
-            4 => out.append(&mut vec![self.duplicate(); duplicate_dist.sample(&mut rng)]),
-            5 => out.append(
-                &mut self.chunked(
-                    chunk_dist
-                        .sample(&mut rng)
-                        .max(secs_to_frames(0.2).min(self.len())),
-                ),
-            ),
-            _ => unreachable!(),
-        });
-    }
-
-    fn add(&self, rhs: &Sample, delay: usize, mix: f32, trunc: bool) -> Self {
-        if self.len() >= rhs.len() || trunc {
-            let left = self.signal[0]
-                .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    if i >= delay && i < delay + rhs.len() {
-                        (1. - mix) * x + mix * rhs.signal[0][i - delay]
-                    } else {
-                        *x
-                    }
-                })
-                .collect();
-            let right = self.signal[1]
-                .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    if i >= delay && i < delay + rhs.len() {
-                        (1. - mix) * x + mix * rhs.signal[1][i - delay]
-                    } else {
-                        *x
-                    }
-                })
-                .collect();
-            Sample {
-                id: self.id,
-                signal: [left, right],
-                state: None,
-                gain: (1. - mix) * self.gain + mix * rhs.gain,
-                spect: None,
-            }
-        } else {
-            rhs.add(self, 0, 1. - mix, true)
-        }
-    }
-
-    fn append(&self, other: &Sample) -> Self {
-        let mut l = self.signal[0].clone();
-        l.append(&mut other.signal[0].clone());
-        let mut r = self.signal[1].clone();
-        r.append(&mut other.signal[1].clone());
-        Sample {
-            id: self.id,
-            signal: [l, r],
-            state: None,
-            gain: (self.gain + other.gain) / 2.,
-            spect: None,
-        }
-    }
-
-    fn truncate(&self, len: usize) -> Self {
-        Sample {
-            id: self.id,
-            signal: [
-                self.signal[0][..len.min(self.len())].to_vec(),
-                self.signal[1][..len.min(self.len())].to_vec(),
-            ],
-            state: None,
-            gain: self.gain,
-            spect: None,
-        }
+            })
+            .collect()
     }
 
     fn duplicate(&self) -> Self {
         Sample {
             id: self.id,
             signal: self.signal.clone(),
+            fx: self.fx.clone(),
             state: None,
-            gain: self.gain,
-            spect: None,
         }
     }
 
-    fn compute_spect(&mut self) {
-        if self.spect.is_some() {
+    fn transforms(&self, n: usize, out: &mut Vec<Sample<'a>>) {
+        let mut rng = rand::thread_rng();
+
+        let types = [0, 1, 2, 3, 4, 5, 6, 7];
+        let type_dist = Uniform::new(0, types.len());
+
+        let split_dist = Uniform::new(self.len() / 4, 3 * self.len() / 4);
+        let pitch_dist = Uniform::new_inclusive(-600, 600);
+        let amplitude_dist = Normal::new(1.0f32, 0.2).expect("amplitude dist");
+        let duplicate_dist = Uniform::new_inclusive(1, 3);
+        let chunk_dist = Uniform::new_inclusive(self.len() / 8, self.len() / 3);
+        let repeat_dist = Uniform::new(1, 4);
+        let shelf_gain = Uniform::new(-30., 30.);
+        let shelf_cutoff = Uniform::new_inclusive(800., 1200.);
+
+        (0..n).for_each(|_| match types[type_dist.sample(&mut rng)] {
+            0 => {
+                out.push(self.with_fx(Fx::Reverse));
+            }
+            1 => {
+                out.extend_from_slice(&self.split(split_dist.sample(&mut rng)));
+            }
+            2 => {
+                out.push(self.with_fx(Fx::Gain(amplitude_dist.sample(&mut rng).clamp(0.6, 1.5))));
+            }
+            3 => {
+                out.push(self.with_fx(Fx::Pitch(pitch_dist.sample(&mut rng))));
+            }
+            4 => out.append(&mut vec![self.duplicate(); duplicate_dist.sample(&mut rng)]),
+            5 => out.append(&mut self.chunked(chunk_dist.sample(&mut rng))),
+            6 => out.push(self.with_fx(Fx::Repeat(repeat_dist.sample(&mut rng)))),
+            7 => out.push(self.with_fx(Fx::Shelf {
+                low: rand::random(),
+                gain: shelf_gain.sample(&mut rng),
+                cutoff: shelf_cutoff.sample(&mut rng) as _,
+            })),
+            _ => unreachable!(),
+        });
+    }
+
+    fn waveform(&self) -> Stereo {
+        self.fx
+            .iter()
+            .fold(stereo_to_owned(self.signal), |signal, fx| match fx {
+                Fx::Reverse => reverse(stereo_borrow(&signal)),
+                Fx::Gain(ratio) => gain(stereo_borrow(&signal), *ratio),
+                Fx::Pitch(cents) => pitch(stereo_borrow(&signal), HZ, *cents),
+                Fx::Add(sample, delay, mix) => add(
+                    stereo_borrow(&signal),
+                    stereo_borrow(&sample.waveform()),
+                    *delay,
+                    Some(*mix),
+                    false,
+                ),
+                Fx::Append(sample) => {
+                    append(stereo_borrow(&signal), stereo_borrow(&sample.waveform()))
+                }
+                Fx::Repeat(n) => {
+                    let mut out = signal.clone();
+                    for _ in 0..*n {
+                        out = append(stereo_borrow(&out), stereo_borrow(&signal));
+                    }
+                    out
+                }
+                Fx::Shelf { low, gain, cutoff } => {
+                    shelf(stereo_borrow(&signal), *low, HZ, *cutoff, *gain)
+                }
+            })
+    }
+
+    fn compute_state(
+        &mut self,
+        waveform: StereoRef,
+        curr: StereoRef,
+        target_spect: &[f32],
+        target_len: usize,
+        delay: Option<usize>,
+    ) {
+        if rms(waveform) < 0.1 {
+            self.state = Some((0, f32::INFINITY, 0.));
             return;
         }
 
-        self.spect = Some(
-            sonogram::SpecOptionsBuilder::new(SPECT_XBINS)
-                .load_data_from_memory_f32(self.signal[0].clone(), HZ)
-                .downsample(4)
-                .set_window_fn(sonogram::hann_function)
-                .build()
-                .expect("spectrogram")
-                .compute()
-                .to_buffer(sonogram::FrequencyScale::Log, SPECT_XBINS, SPECT_YBINS),
-        );
-    }
-
-    fn mse(a: &Sample, b: &Sample) -> f64 {
-        a.spect
-            .as_ref()
-            .unwrap()
-            .iter()
-            .zip(b.spect.as_ref().unwrap())
-            .map(|(a, b)| ((a - b) * (a - b)) as f64)
-            .sum::<f64>()
-    }
-
-    fn compute_state(&mut self, curr: &Sample, target: &Sample, delay: Option<usize>) {
-        // mse = 1/n * (target - self)^2
-
         let delay = delay.unwrap_or_else(|| {
-            let pick = Uniform::new(0, (target.len() - self.len()).max(1))
-                .sample(&mut rand::thread_rng()) as f64;
-            let on_time = (pick as f64 / bpm_to_frames(TARGET_BPM) as f64).round()
-                * bpm_to_frames(TARGET_BPM) as f64;
-            (pick * (1. - I_GOT_RHYTHM as f64) + on_time * I_GOT_RHYTHM as f64) as _
+            let pick = Uniform::new(0, (target_len - waveform[0].len()).max(1))
+                .sample(&mut rand::thread_rng()) as f32;
+            let on_time = (pick / bpm_to_frames(TARGET_BPM) as f32).round()
+                * bpm_to_frames(TARGET_BPM) as f32;
+            (pick * (1. - I_GOT_RHYTHM) + on_time * I_GOT_RHYTHM) as _
         });
 
-        let mix = Uniform::new(0.5, 1.0).sample(&mut rand::thread_rng());
+        let score = mse(
+            &spectro(
+                stereo_borrow(&normalize(stereo_borrow(&add(
+                    curr, waveform, delay, None, true,
+                )))),
+                HZ,
+                SPECT_XBINS,
+                SPECT_YBINS,
+            ),
+            target_spect,
+        );
 
-        let mut next = curr.add(self, delay, mix, true);
-        next.compute_spect();
-        let sum = Sample::mse(&next, &target);
-
-        self.state = Some((delay as _, sum, mix));
+        self.state = Some((delay as _, score, 1.0));
     }
+}
+
+fn mse(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / a.len() as f32
 }
 
 fn main() {
@@ -425,8 +259,10 @@ fn main() {
         .apply()
         .expect("log");
 
-    let mut target = Sample::from_wav("target.wav");
-    target.compute_spect();
+    let target_signal = load_wav("target.wav", HZ);
+    let target_spect = spectro(stereo_borrow(&target_signal), HZ, SPECT_XBINS, SPECT_YBINS);
+
+    let mut cache = vec![];
 
     let mut initial = read_dir("samples")
         .expect("read samples folder")
@@ -434,43 +270,107 @@ fn main() {
         .filter(|file| {
             file.file_type().unwrap().is_file() && file.path().extension().unwrap() == "wav"
         })
-        .flat_map(|file| Sample::from_wav(file.path()).chunked(target.len()))
+        .flat_map(|file| {
+            let signal = Rc::new(load_wav(file.path(), HZ));
+            cache.push(signal.clone());
+            Sample::new(unsafe {
+                [
+                    std::mem::transmute(&signal[0][..]),
+                    std::mem::transmute(&signal[0][..]),
+                ]
+            })
+            .chunked(8 * bpm_to_frames(TARGET_BPM))
+        })
+        //.filter(|chunk| rms(chunk.signal) > 0.1)
         .collect::<Vec<_>>();
     initial
         .iter_mut()
         .enumerate()
         .for_each(|(i, sample)| sample.id = i as _);
 
-    let mut out = Sample::new(target.len());
+    let mut out = [
+        vec![0.; target_signal[0].len()],
+        vec![0.; target_signal[0].len()],
+    ];
 
-    let _ = std::fs::remove_dir_all("checkpoints");
-    std::fs::create_dir("checkpoints").expect("mkdir checkpoints");
+    let base_score = mse(
+        &spectro(stereo_borrow(&out), HZ, SPECT_XBINS, SPECT_YBINS),
+        &target_spect,
+    );
 
-    out.compute_spect();
-    let mut last_score = Sample::mse(&out, &target);
-    let first_score = last_score;
+    let mut first_cycle = 0;
+    if Path::new("checkpoints").is_dir() {
+        let re = Regex::new(r"^C([0-9]+)\.wav$").unwrap();
+
+        if let Some((file, cycle)) = read_dir("checkpoints")
+            .expect("read checkpoints folder")
+            .filter_map(|file| file.ok())
+            .filter_map(|file| {
+                file.file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| {
+                        re.captures(file.file_name().to_str()?)
+                            .and_then(|caps| caps.get(1))
+                            .and_then(|cap| cap.as_str().parse::<u32>().ok())
+                    })
+                    .flatten()
+                    .map(|cycle| (file, cycle))
+            })
+            .max_by_key(|(_, cycle)| *cycle)
+        {
+            first_cycle = cycle;
+            out = load_wav(file.path(), HZ);
+            println!(
+                "Loaded checkpoint {} at cycle {}",
+                file.path().file_name().unwrap().to_str().unwrap(),
+                cycle,
+            );
+        }
+    } else {
+        std::fs::create_dir("checkpoints").expect("mkdir checkpoints");
+    }
+
+    let mut last_score = mse(
+        &spectro(stereo_borrow(&out), HZ, SPECT_XBINS, SPECT_YBINS),
+        &target_spect,
+    );
+
+    if first_cycle > 0 {
+        println!("{:.2}%", 100. * (1. - last_score / base_score));
+    }
 
     let mut max_cycles = CYCLES;
-    for i in 0..max_cycles {
+    let mut i = first_cycle;
+    while i < max_cycles {
         println!("Cycle {}", i + 1);
         log::debug!("[Cycle {}]", i + 1);
 
-        let sort = |mut all: Vec<Sample>| {
+        fn sort<'a>(
+            mut all: Vec<Sample<'a>>,
+            out: StereoRef,
+            target_spect: &[f32],
+            target_len: usize,
+        ) -> Vec<Sample<'a>> {
             // calculate and sort by fitness
-            all = all
-                .into_iter()
-                .filter(|s| s.len() >= secs_to_frames(0.2))
-                .collect();
-            all.iter_mut().for_each(|s| {
-                s.compute_state(&out, &target, None);
+            all.retain(|s| !FILTER_SHORT || s.len() >= bpm_to_frames(TARGET_BPM));
+            all.par_iter_mut().for_each(|s| {
+                let waveform = s.waveform();
+                s.compute_state(
+                    stereo_borrow(&waveform),
+                    out,
+                    target_spect,
+                    target_len,
+                    None,
+                );
             });
             all.sort_unstable_by(|a, b| {
                 a.state.unwrap().1.partial_cmp(&b.state.unwrap().1).unwrap()
             });
             all
-        };
+        }
 
-        let eliminate = |mut all: Vec<Sample>| {
+        fn eliminate(mut all: Vec<Sample>) -> Vec<Sample> {
             // eliminate the weakest
             let survival_count = ((all.len() as f32 * SURVIVAL_RATIO) as usize)
                 .min(all.len())
@@ -478,14 +378,13 @@ fn main() {
             all = all[..survival_count].to_vec();
             log::debug!("{} samples survived", survival_count);
             all
-        };
+        }
 
-        let mutate = |mut all: Vec<Sample>| {
+        fn mutate(mut all: Vec<Sample>) -> Vec<Sample> {
             // transform
-            let mut max_len = 0;
             let mut next = vec![];
             all.iter().for_each(|sample| {
-                sample.transforms(OFFSPRINGS_PER_SAMPLE, &target, &mut next, &mut max_len);
+                sample.transforms(OFFSPRINGS_PER_SAMPLE, &mut next);
             });
 
             let mutation_count = next.len();
@@ -502,8 +401,13 @@ fn main() {
                     .map(|k| {
                         let mut rng = rand::thread_rng();
                         match Uniform::new(0, 2).sample(&mut rng) {
-                            0 => all[k].add(&all[crossover_dist.sample(&mut rng)], 0, 0.5, false),
-                            1 => all[k].append(&all[crossover_dist.sample(&mut rng)]),
+                            0 => all[k].with_fx(Fx::Add(
+                                all[crossover_dist.sample(&mut rng)].clone(),
+                                0,
+                                0.5,
+                            )),
+                            1 => all[k]
+                                .with_fx(Fx::Append(all[crossover_dist.sample(&mut rng)].clone())),
                             _ => unreachable!(),
                         }
                     }),
@@ -514,50 +418,59 @@ fn main() {
 
             all.append(&mut next);
             all
-        };
+        }
 
-        let write = |all: &[Sample], out: &mut Sample, write_log: bool| {
+        fn write(all: &[Sample], out: &mut Stereo, target_len: usize) {
             all.iter()
                 .take(OUTPUT_CAPACITY.min(all.len()))
                 .rev()
                 .for_each(|best| {
-                    let (delay, mix) = best
+                    let (delay, _mix) = best
                         .state
-                        .map(|(delay, _, mix)| {
-                            ((delay as usize).min(target.len() - best.len()), mix)
-                        })
+                        .map(|(delay, _, mix)| ((delay as usize).min(target_len - best.len()), mix))
                         .unwrap();
-                    *out = out.add(best, delay, mix, true);
 
-                    if write_log {
-                        log::debug!(
-                            "Output id {} with delay {}s, {}s, mix {}",
-                            best.id,
-                            frames_to_secs(delay),
-                            frames_to_secs(best.len()),
-                            mix,
-                        );
-                    }
+                    *out = add(
+                        stereo_borrow(out),
+                        stereo_borrow(&best.waveform()),
+                        delay,
+                        None,
+                        true,
+                    );
                 });
-        };
 
-        let mut all = initial.clone();
+            *out = normalize(stereo_borrow(out));
+        }
+
+        let mut all: Vec<_> = Uniform::new(0, initial.len())
+            .sample_iter(&mut rand::thread_rng())
+            .take(INITIAL_POPULATION.min(initial.len()))
+            .map(|i| initial[i].clone())
+            .collect();
 
         all = mutate(all);
         let mut best_score;
         let mut j = 0;
+        let mut best_out;
         while {
             print!("Gen {}, ", j + 1);
             std::io::stdout().flush().unwrap();
             log::debug!("[Generation {}]", j + 1);
             log::debug!("{} samples", all.len());
 
-            all = eliminate(sort(all));
+            all = eliminate(sort(
+                all,
+                stereo_borrow(&out),
+                &target_spect,
+                target_signal[0].len(),
+            ));
 
-            let mut scored = out.clone();
-            write(&all, &mut scored, false);
-            scored.compute_spect();
-            best_score = Sample::mse(&scored, &target);
+            best_out = out.clone();
+            write(&all, &mut best_out, target_signal[0].len());
+            best_score = mse(
+                &spectro(stereo_borrow(&best_out), HZ, SPECT_XBINS, SPECT_YBINS),
+                &target_spect,
+            );
 
             all = mutate(all);
 
@@ -565,26 +478,33 @@ fn main() {
             j < GENERATION_MIN || (j < GENERATION_MAX && best_score > last_score)
         } {}
 
-        if best_score > last_score {
+        if !ALLOW_REGRESSION && best_score > last_score {
             println!("... Regressed\n");
             max_cycles += 1;
             continue;
         }
 
-        all = sort(all);
+        all = sort(
+            all,
+            stereo_borrow(&out),
+            &target_spect,
+            target_signal[0].len(),
+        );
         println!();
 
         // keep the best
-        write(&all, &mut out, true);
+        out = best_out;
 
-        out.spect = None;
-        out.compute_spect();
-        last_score = Sample::mse(&out, &target);
+        last_score = best_score;
 
-        println!("{:.2}%", 100. * (1. - last_score / first_score));
+        println!("{:.2}%", 100. * (1. - last_score / base_score));
 
         if (i + 1) % 10 == 0 {
-            out.save_to_wav(format!("checkpoints/C{}.wav", i + 1));
+            save_to_wav(
+                stereo_borrow(&out),
+                format!("checkpoints/C{}.wav", i + 1),
+                HZ,
+            );
         }
 
         log::debug!(
@@ -592,7 +512,9 @@ fn main() {
             all[0].state.unwrap().1,
             all.last().unwrap().state.unwrap().1
         );
+
+        i += 1;
     }
 
-    out.save_to_wav("out.wav");
+    save_to_wav(stereo_borrow(&out), "out.wav", HZ);
 }
